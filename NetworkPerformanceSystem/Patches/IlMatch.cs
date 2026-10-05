@@ -1,0 +1,152 @@
+using HarmonyLib;
+using System.Collections.Generic;
+using System.Reflection;
+using System.Reflection.Emit;
+using System.Text;
+
+namespace NetworkPerformanceSystem.Patches {
+
+    /// <summary>
+    /// Small predicates shared by the transpilers. Every mechanism here works by finding a
+    /// hard-coded constant and rewriting it, so "is this instruction the number N" is the one
+    /// question all of them ask, and it has to be asked the same way in each - a transpiler that
+    /// matches only one of the two encodings silently half-patches its method.
+    /// </summary>
+    internal static class IlMatch {
+
+        /// <summary>
+        /// Reads both int32 constant encodings. Which one Roslyn picks depends on the value
+        /// (Ldc_I4_S for anything in sbyte range, Ldc_I4 above it), so an anchor that assumes one
+        /// stops matching the day the game's own constant changes magnitude.
+        /// </summary>
+        internal static bool TryGetInt32Constant(CodeInstruction code, out int value) {
+            if (code.opcode == OpCodes.Ldc_I4 && code.operand is int wide) { value = wide; return true; }
+            if (code.opcode == OpCodes.Ldc_I4_S && code.operand is sbyte narrow) { value = narrow; return true; }
+            value = 0;
+            return false;
+        }
+
+        internal static bool IsInt32Constant(CodeInstruction code, int value) {
+            return TryGetInt32Constant(code, out int found) && found == value;
+        }
+
+        internal static int CountInt32Constant(List<CodeInstruction> codes, int value) {
+            int count = 0;
+            for (int i = 0; i < codes.Count; i++) {
+                if (IsInt32Constant(codes[i], value)) { count++; }
+            }
+            return count;
+        }
+
+        /// <summary>
+        /// Name-only match on the member a call or field access targets. Used where the declaring
+        /// type lives in an assembly we deliberately do not reference at compile time (PlayFab),
+        /// so the transpiler can be JIT-compiled on a process where that assembly is absent.
+        /// Several names are accepted for the sites where the client and dedicated server builds
+        /// of the game reach the same number through different calls.
+        /// </summary>
+        internal static bool TargetsMemberNamed(CodeInstruction code, params string[] names) {
+            if (!(code.operand is MemberInfo member)) { return false; }
+            for (int i = 0; i < names.Length; i++) {
+                if (member.Name == names[i]) { return true; }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Name-only match on a parameterless construction. Same contract as TargetsMemberNamed -
+        /// the declaring type is matched by name, not by reference - because a ctor's own name is
+        /// always ".ctor" and says nothing about what is being built. Arity is part of the anchor:
+        /// ZPackage has five constructors and only the empty one is the allocation we replace.
+        /// </summary>
+        internal static bool IsNewObj(CodeInstruction code, string declaringTypeName, int argumentCount) {
+            return code.opcode == OpCodes.Newobj
+                   && code.operand is ConstructorInfo ctor
+                   && ctor.DeclaringType != null
+                   && ctor.DeclaringType.Name == declaringTypeName
+                   && ctor.GetParameters().Length == argumentCount;
+        }
+
+        internal static int CountNewObj(List<CodeInstruction> codes, string declaringTypeName, int argumentCount) {
+            int count = 0;
+            for (int i = 0; i < codes.Count; i++) {
+                if (IsNewObj(codes[i], declaringTypeName, argumentCount)) { count++; }
+            }
+            return count;
+        }
+
+        /// <summary>
+        /// DescribeNeighbours for construction anchors. Every constructor of the named type,
+        /// whatever its arity, paired with the instruction AFTER it - for a newobj that is the
+        /// store telling us which local the new object became, which is the fact that identifies
+        /// the site. Arity is printed because a count that came out wrong is usually a constructor
+        /// overload changing, not the site moving.
+        /// </summary>
+        internal static string DescribeNewObj(List<CodeInstruction> codes, string declaringTypeName) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < codes.Count; i++) {
+                if (!(codes[i].operand is ConstructorInfo ctor) || codes[i].opcode != OpCodes.Newobj) { continue; }
+                if (ctor.DeclaringType == null || ctor.DeclaringType.Name != declaringTypeName) { continue; }
+                if (sb.Length > 0) { sb.Append("; "); }
+                sb.Append($"newobj {ctor.DeclaringType.Name}..ctor/{ctor.GetParameters().Length}");
+                if (i + 1 < codes.Count) { sb.Append(" -> ").Append(Describe(codes[i + 1])); }
+            }
+            return sb.Length > 0 ? sb.ToString() : "no construction of " + declaringTypeName + " in the method";
+        }
+
+        /// <summary>
+        /// One entry per reference to any of the named members, each paired with the instruction
+        /// before it - the operand the anchors expect to be a constant. Logged when an anchor
+        /// misses: "found 0" says nothing about what the game actually has there, and that is the
+        /// one fact a report from a build we cannot see has to carry. The dedicated server build
+        /// asking for 11 where the client asks for 10 went undiagnosed for exactly that reason.
+        /// </summary>
+        internal static string DescribeNeighbours(List<CodeInstruction> codes, params string[] memberNames) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < codes.Count; i++) {
+                if (!TargetsMemberNamed(codes[i], memberNames)) { continue; }
+                if (sb.Length > 0) { sb.Append("; "); }
+                if (i > 0) { sb.Append(Describe(codes[i - 1])).Append(" -> "); }
+                sb.Append(Describe(codes[i]));
+            }
+            return sb.Length > 0 ? sb.ToString() : "no reference to " + string.Join("/", memberNames) + " in the method";
+        }
+
+        private static string Describe(CodeInstruction code) {
+            if (code.operand is MemberInfo member) { return $"{code.opcode} {member.DeclaringType?.Name}.{member.Name}"; }
+            return code.operand == null ? code.opcode.ToString() : $"{code.opcode} {code.operand}";
+        }
+
+        /// <summary>
+        /// Replaces one instruction in place, carrying its labels and exception-handler blocks
+        /// onto the replacement. Skipping this is the classic transpiler bug: a branch that
+        /// targeted the old instruction ends up pointing at nothing.
+        /// </summary>
+        internal static void ReplaceInPlace(List<CodeInstruction> codes, int index, CodeInstruction replacement) {
+            replacement.labels.AddRange(codes[index].labels);
+            replacement.blocks.AddRange(codes[index].blocks);
+            codes[index] = replacement;
+        }
+
+        private static readonly HashSet<string> Reported = new HashSet<string>();
+
+        /// <summary>
+        /// Logs a transpiler's outcome once per distinct message. Harmony rebuilds a method from
+        /// its original IL and re-runs every transpiler on it each time any mod adds a patch
+        /// there, so ours runs again for every later patch - ZNet.RPC_PeerInfo is the connection
+        /// handshake every ServerSync mod hooks, and M10's line came out 39 times in one startup
+        /// log. Each run rewrites fresh IL, so nothing stacks; only the line repeats. A message
+        /// that differs from one already printed (a different site count, a miss after a hit) is
+        /// new information and still goes out.
+        /// </summary>
+        internal static void LogOnce(string message) {
+            if (Reported.Add(message)) { Logger.LogInfo(message); }
+        }
+
+        /// <summary>LogOnce for the misses that warn without disabling a mechanism. The ones that
+        /// disable go through PatchGuard.Disable, which already reports once per mechanism.</summary>
+        internal static void WarnOnce(string message) {
+            if (Reported.Add(message)) { Logger.LogWarning(message); }
+        }
+    }
+}
